@@ -1,0 +1,16 @@
+{
+  "name": "whatsapp-agent-n8n-bridge",
+  "version": "1.0.0",
+  "description": "Long-polls the WhatsApp Agent Platform and hands each message to n8n for reply logic.",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1"
+  }
+}
