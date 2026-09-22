@@ -1,273 +1,271 @@
-// MUST BE AT THE VERY TOP TO LOAD ENVIRONMENT VARIABLES FROM .env
 require('dotenv').config();
-
 const fs = require('fs');
 const path = require('path');
 
-// ============================================================
-// CONFIGURATION & STATE MANAGEMENT
-// ============================================================
+const OFFSET_FILE = path.join(__dirname, process.env.OFFSET_FILE || 'offset.json');
+const delay = (ms) => new Promise((res) => setTimeout(res, ms));
 
-const CONFIG = {
-    API_BASE_URL: process.env.WA_API_BASE_URL || 'https://api.whatsapp.com/agent/v1',
-    BEARER_TOKEN: process.env.WA_BEARER_TOKEN,
-    N8N_WEBHOOK_URL: process.env.N8N_WEBHOOK_URL || '',
-    OFFSET_FILE: path.join(__dirname, process.env.OFFSET_FILE || 'offset.json'),
-    POLL_INTERVAL_MS: 4500,
-    RATE_LIMIT_DELAY_MS: 72000,
-    POLL_TIMEOUT_SEC: 15
-};
+// ============================================================
+// AGENT REGISTRY
+// ============================================================
+// Dynamically build active agents that have configured tokens
+const AGENTS = [
+    {
+        id: 'agent_1',
+        name: process.env.AGENT1_NAME || 'Agent 1',
+        baseUrl: (process.env.AGENT1_BASE_URL || process.env.WA_API_BASE_URL || 'https://api.whatsapp.com/agent/v1').replace(/\/+$/, ''),
+        token: process.env.AGENT1_TOKEN || process.env.WA_BEARER_TOKEN,
+        n8nUrl: process.env.AGENT1_N8N_URL || process.env.N8N_WEBHOOK_URL
+    },
+    {
+        id: 'agent_2',
+        name: process.env.AGENT2_NAME || 'Agent 2',
+        baseUrl: (process.env.AGENT2_BASE_URL || 'https://api.whatsapp.com/agent/v1').replace(/\/+$/, ''),
+        token: process.env.AGENT2_TOKEN,
+        n8nUrl: process.env.AGENT2_N8N_URL
+    },
+    {
+        id: 'agent_3',
+        name: process.env.AGENT3_NAME || 'Agent 3',
+        baseUrl: (process.env.AGENT3_BASE_URL || 'https://api.whatsapp.com/agent/v1').replace(/\/+$/, ''),
+        token: process.env.AGENT3_TOKEN,
+        n8nUrl: process.env.AGENT3_N8N_URL
+    }
+].filter(agent => Boolean(agent.token)); // Run only agents with configured tokens
 
-// Validate key presence immediately
-if (!CONFIG.BEARER_TOKEN || CONFIG.BEARER_TOKEN === 'YOUR_AGENT_API_KEY') {
-    console.error('❌ Error: WA_BEARER_TOKEN is missing or unconfigured in your .env file.');
+if (AGENTS.length === 0) {
+    console.error('❌ No active agents configured. Check your .env file.');
     process.exit(1);
 }
 
 // ============================================================
-// HELPER: CENTRAL API REQUEST WRAPPER
+// OFFSET MANAGEMENT (PER-AGENT ISOLATION)
 // ============================================================
-
-async function apiRequest(endpoint, options = {}) {
-    const url = `${CONFIG.API_BASE_URL}${endpoint}`;
-    const controller = new AbortController();
-    
-    const timeoutMs = options.timeout || (CONFIG.POLL_TIMEOUT_SEC + 5) * 1000;
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
-    const headers = {
-        'Authorization': `Bearer ${CONFIG.BEARER_TOKEN}`,
-        ...options.headers
-    };
-
-    if (options.body && !headers['Content-Type']) {
-        headers['Content-Type'] = 'application/json';
+function loadOffset(agentId) {
+    try {
+        if (fs.existsSync(OFFSET_FILE)) {
+            const parsed = JSON.parse(fs.readFileSync(OFFSET_FILE, 'utf8'));
+            return parsed[agentId] ?? null;
+        }
+    } catch (err) {
+        console.warn(`[${agentId}] Warning reading offset:`, err.message);
     }
+    return null;
+}
 
+function saveOffset(agentId, offset) {
+    try {
+        let store = {};
+        if (fs.existsSync(OFFSET_FILE)) {
+            try { store = JSON.parse(fs.readFileSync(OFFSET_FILE, 'utf8')); } catch { store = {}; }
+        }
+        store[agentId] = offset;
+        fs.writeFileSync(OFFSET_FILE, JSON.stringify(store, null, 2), 'utf8');
+    } catch (err) {
+        console.error(`[${agentId}] Failed to save offset:`, err.message);
+    }
+}
+
+// ============================================================
+// MESSAGING ENGINE
+// ============================================================
+async function sendWhatsAppMessage(agent, toUserId, body) {
+    if (!toUserId || !body) return false;
+
+    const url = `${agent.baseUrl}/messages`;
     try {
         const response = await fetch(url, {
-            ...options,
-            headers,
-            signal: controller.signal
-        });
-
-        clearTimeout(timeout);
-
-        if (response.status === 204) {
-            return { statusCode: 204, data: null };
-        }
-
-        const data = await response.json().catch(() => ({}));
-
-        if (!response.ok) {
-            const err = new Error(`API Error ${response.status}: ${data?.error?.message || response.statusText}`);
-            err.status = response.status;
-            err.code = data?.error?.code;
-            err.details = data?.error?.error_data?.details;
-            err.fbtrace_id = data?.error?.fbtrace_id;
-            throw err;
-        }
-
-        return { statusCode: response.status, data };
-    } catch (error) {
-        clearTimeout(timeout);
-        throw error;
-    }
-}
-
-// ============================================================
-// OFFSET MANAGEMENT
-// ============================================================
-
-function loadOffset() {
-    try {
-        if (fs.existsSync(CONFIG.OFFSET_FILE)) {
-            const fileData = fs.readFileSync(CONFIG.OFFSET_FILE, 'utf8');
-            const parsed = JSON.parse(fileData);
-            if (typeof parsed.offset === 'number') {
-                return parsed.offset;
-            }
-        }
-    } catch (error) {
-        console.warn('⚠️ Could not read offset file:', error.message);
-    }
-    return null; 
-}
-
-function saveOffset(offset) {
-    try {
-        fs.writeFileSync(CONFIG.OFFSET_FILE, JSON.stringify({ offset }, null, 2), 'utf8');
-    } catch (error) {
-        console.error('❌ Failed to save offset:', error.message);
-    }
-}
-
-// ============================================================
-// MESSAGING & STATUS APIS
-// ============================================================
-
-async function markReadAndTyping(messageId, showTyping = false) {
-    if (!messageId) return;
-
-    const payload = {
-        messaging_product: 'whatsapp',
-        status: 'read',
-        message_id: messageId
-    };
-
-    if (showTyping) {
-        payload.typing_indicator = { type: 'text' };
-    }
-
-    try {
-        await apiRequest('/statuses', {
             method: 'POST',
-            body: JSON.stringify(payload)
-        });
-        console.log(`✓ Marked message ${messageId} as read ${showTyping ? '(typing...)' : ''}`);
-    } catch (error) {
-        console.error(`⚠️ Failed to set status on ${messageId}:`, error.message);
-    }
-}
-
-async function sendText(toUserId, body) {
-    if (!toUserId || !body) {
-        console.error('❌ Missing participant ID or message body');
-        return false;
-    }
-
-    try {
-        const { data } = await apiRequest('/messages', {
-            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${agent.token}`,
+                'Content-Type': 'application/json'
+            },
             body: JSON.stringify({
                 messaging_product: 'whatsapp',
+                recipient_type: 'individual',
                 to: toUserId,
                 type: 'text',
-                text: {
-                    body: String(body).substring(0, 4096)
-                }
+                text: { body: String(body).substring(0, 4096) }
             }),
-            timeout: 30000
+            signal: AbortSignal.timeout(20000)
         });
 
-        const wamid = data?.messages?.[0]?.id;
-        console.log(`✓ WhatsApp reply sent to ${toUserId} [WAMID: ${wamid}]`);
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            console.error(`[${agent.name}] ❌ Reply failed (${response.status}):`, data?.error?.message || response.statusText);
+            return false;
+        }
+
+        const msgId = data?.messages?.[0]?.id || 'OK';
+        console.log(`[${agent.name}] ✓ Reply dispatched to ${toUserId} [ID: ${msgId}]`);
         return true;
-    } catch (error) {
-        console.error(`❌ Failed to send message to ${toUserId}:`, error.message);
-        if (error.details) console.error('Details:', error.details);
+    } catch (err) {
+        console.error(`[${agent.name}] ❌ Network error sending to ${toUserId}:`, err.message);
         return false;
     }
 }
 
-// ============================================================
-// POLLING & MESSAGE PROCESSING ENGINE
-// ============================================================
-
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-async function processUpdate(changeValue) {
-    const messages = changeValue.messages || [];
-
-    for (const message of messages) {
-        const messageId = message.id;
-        const senderId = message.from;
-
-        console.log(`📩 Received message ${messageId} from ${senderId}`);
-
-        // Step 1: Mark as read + trigger typing indicator
-        await markReadAndTyping(messageId, true);
-        await delay(CONFIG.RATE_LIMIT_DELAY_MS);
-
-        // Step 2 & 3: Forward to n8n Webhook and send back n8n's reply
-        if (message.type === 'text' && message.text?.body) {
-            const incomingText = message.text.body;
-            console.log(`   Content: "${incomingText}"`);
-
-            let replyText = '';
-
-            if (CONFIG.N8N_WEBHOOK_URL) {
-                try {
-                    const response = await fetch(CONFIG.N8N_WEBHOOK_URL, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ messageId, senderId, text: incomingText, timestamp: message.timestamp }),
-                        signal: AbortSignal.timeout(10000) // don't hang if n8n is unreachable
-                    });
-                    if (!response.ok) {
-                        const bodyText = await response.text().catch(() => '');
-                        console.error(`❌ n8n webhook returned ${response.status}: ${bodyText.slice(0, 300)}`);
-                    } else {
-                        const n8nData = await response.json().catch(() => ({}));
-                        const resultData = Array.isArray(n8nData) ? n8nData[0] : n8nData;
-                        replyText = resultData?.reply || resultData?.summary || resultData?.text || '';
-                    }
-                } catch (err) {
-                    console.error('❌ Failed to call n8n webhook:', err.message);
-                }
-            }
-
-            // Fallback if n8n returns no text or fails
-            if (!replyText) {
-                replyText = `Hello! You said: "${incomingText}"`;
-            }
-
-            // Send actual dynamic reply to WhatsApp
-            await sendText(senderId, replyText);
-            await delay(CONFIG.RATE_LIMIT_DELAY_MS);
-        }
+async function markRead(agent, messageId) {
+    if (!messageId) return;
+    try {
+        await fetch(`${agent.baseUrl}/statuses`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${agent.token}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                messaging_product: 'whatsapp',
+                status: 'read',
+                message_id: messageId,
+                typing_indicator: { type: 'text' }
+            }),
+            signal: AbortSignal.timeout(10000)
+        });
+    } catch {
+        // Status tracking is optional on some bridges
     }
 }
 
+function extractMessages(payload) {
+    if (!payload) return [];
+    if (payload.entry && Array.isArray(payload.entry)) {
+        const list = [];
+        for (const entry of payload.entry) {
+            for (const change of entry.changes || []) {
+                if (change.value?.messages) {
+                    list.push(...change.value.messages);
+                }
+            }
+        }
+        if (list.length > 0) return list;
+    }
+    if (Array.isArray(payload.messages)) return payload.messages;
+    if (Array.isArray(payload.updates)) return payload.updates;
+    if (Array.isArray(payload)) return payload;
+    return [];
+}
 
-async function pollUpdates() {
-    let currentOffset = loadOffset();
-    console.log(`🚀 Agent Started. Current Offset: ${currentOffset ?? 'HEAD (New messages only)'}`);
+async function handleMessage(agent, msg) {
+    const messageId = msg.id || msg.key?.id;
+    const senderId = msg.from || msg.key?.remoteJid || msg.sender;
+    const incomingText = msg.text?.body || msg.body || (typeof msg.message === 'string' ? msg.message : '');
+
+    if (!senderId || !incomingText) return;
+
+    console.log(`[${agent.name}] 📩 Incoming from ${senderId}: "${incomingText}"`);
+
+    await markRead(agent, messageId);
+
+    // Forward to that agent's specific n8n webhook
+    let replyText = '';
+    if (agent.n8nUrl) {
+        try {
+            const res = await fetch(agent.n8nUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    agentId: agent.id,
+                    agentName: agent.name,
+                    messageId,
+                    senderId,
+                    text: incomingText,
+                    timestamp: msg.timestamp || Date.now()
+                }),
+                signal: AbortSignal.timeout(15000)
+            });
+
+            if (res.ok) {
+                const n8nData = await res.json().catch(() => ({}));
+                const result = Array.isArray(n8nData) ? n8nData[0] : n8nData;
+                replyText = result?.reply || result?.summary || result?.text || result?.output || '';
+            } else {
+                console.error(`[${agent.name}] ❌ n8n returned ${res.status}`);
+            }
+        } catch (err) {
+            console.error(`[${agent.name}] ⚠️ Could not reach n8n URL:`, err.message);
+        }
+    }
+
+    if (!replyText) {
+        replyText = `Hello! You reached ${agent.name}. You said: "${incomingText}"`;
+    }
+
+    await delay(1200);
+    await sendWhatsAppMessage(agent, senderId, replyText);
+}
+
+// ============================================================
+// AGENT WORKER POLLING LOOP
+// ============================================================
+async function runAgentWorker(agent) {
+    let currentOffset = loadOffset(agent.id);
+    console.log(`🚀 [${agent.name}] Worker started. Offset: ${currentOffset ?? 'HEAD (Latest)'}`);
 
     while (true) {
         try {
             const params = new URLSearchParams();
-            if (currentOffset !== null) params.append('offset', currentOffset);
-            params.append('timeout', CONFIG.POLL_TIMEOUT_SEC);
-            params.append('limit', 50);
+            if (currentOffset !== null && currentOffset !== undefined) {
+                params.append('offset', String(currentOffset));
+            }
+            params.append('timeout', '15');
 
-            const { statusCode, data } = await apiRequest(`/updates?${params.toString()}`, { method: 'GET' });
+            const res = await fetch(`${agent.baseUrl}/updates?${params.toString()}`, {
+                headers: {
+                    'Authorization': `Bearer ${agent.token}`,
+                    'Content-Type': 'application/json'
+                },
+                signal: AbortSignal.timeout(22000)
+            });
 
-            if (statusCode === 204) {
+            if (res.status === 204) {
                 await delay(1000);
                 continue;
             }
 
-            if (data?.entry) {
-                for (const entry of data.entry) {
-                    for (const change of entry.changes || []) {
-                        if (change.field === 'messages' && change.value) {
-                            await processUpdate(change.value);
-                        }
-                    }
+            const rawText = await res.text();
+            let data = null;
+            try { data = JSON.parse(rawText); } catch { data = { raw: rawText }; }
+
+            if (!res.ok) {
+                if (res.status === 409) {
+                    console.warn(`[${agent.name}] ⚠️ Conflict (409): Another instance running. Waiting 15s...`);
+                    await delay(15000);
+                } else if (res.status === 400) {
+                    console.error(`[${agent.name}] ❌ 400 Bad Request:`, data);
+                    await delay(6000);
+                } else {
+                    console.error(`[${agent.name}] ⚠️ HTTP ${res.status}:`, data);
+                    await delay(4000);
                 }
+                continue;
             }
 
-            if (data?.next_offset !== undefined) {
-                currentOffset = data.next_offset;
-                saveOffset(currentOffset);
+            const messages = extractMessages(data);
+            for (const msg of messages) {
+                await handleMessage(agent, msg);
             }
 
-        } catch (error) {
-            if (error.status === 429) {
-                console.warn('⚠️ Rate limit hit (429). Backing off 10s...');
-                await delay(10000);
-            } else if (error.status === 409) {
-                console.error('❌ Conflict (409): Another polling instance replaced this process.');
-                process.exit(1);
-            } else {
-                console.error('⚠️ Update poll error:', error.message);
-                await delay(5000);
+            // Update isolated offset for this specific agent
+            const nextOffset = data?.next_offset ?? data?.offset ?? data?.last_offset;
+            if (nextOffset !== undefined && nextOffset !== null) {
+                currentOffset = nextOffset;
+                saveOffset(agent.id, currentOffset);
             }
+
+        } catch (err) {
+            console.error(`[${agent.name}] Loop error:`, err.message);
+            await delay(3000);
         }
 
-        await delay(CONFIG.POLL_INTERVAL_MS);
+        await delay(2500);
     }
 }
 
-// Start Agent Polling Loop
-pollUpdates();
+// ============================================================
+// CONCURRENT BOOTSTRAP
+// ============================================================
+console.log(`Starting ${AGENTS.length} isolated WhatsApp agent workers concurrently...`);
+AGENTS.forEach(agent => {
+    runAgentWorker(agent);
+});
